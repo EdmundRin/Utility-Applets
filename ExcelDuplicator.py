@@ -132,7 +132,14 @@ def main():
     if mode == "row" or mode == "col":
         try:
             index_str = input(f"请输入要复制的{mode}编号(用英文逗号分隔，如 3,1,5): ")
-            indices = [int(x.strip()) for x in index_str.split(",")]
+            
+            if index_str.lower() in ("all", "*"):
+                if mode == "row":
+                    indices = list(range(1, sheet.max_row + 1))
+                else:  # mode == "col"
+                    indices = list(range(1, sheet.max_column + 1))
+            else:
+                indices = [int(x.strip()) for x in index_str.split(",") if x.strip().isdigit()]
 
             keep_style = input("是否保留单元格格式? (y/n): ").strip().lower() == "y"
 
@@ -162,10 +169,14 @@ def main():
                 display_column_headers(sheet)
 
             col_input = input("请输入要提取的列编号 (按顺序，用英文逗号分隔，如 4,1): ")
-            selected_cols = [int(c.strip()) for c in col_input.split(",") if c.strip().isdigit()]
-            if not selected_cols:
-                print("未输入有效的列编号。")
-                return
+            
+            if col_input.lower() in ("all", "*"):
+                selected_cols = list(range(1, sheet.max_column + 1))
+            else:
+                selected_cols = [int(c.strip()) for c in col_input.split(",") if c.strip().isdigit()]
+                if not selected_cols:
+                    print("未输入有效的列编号。")
+                    return
 
             keep_style = input("是否保留单元格格式? (y/n): ").strip().lower() == "y"
 

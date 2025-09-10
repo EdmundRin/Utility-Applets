@@ -4,16 +4,44 @@ warnings.filterwarnings("ignore",
                         module="openpyxl.styles.stylesheet")
 
 import pandas as pd
-from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
-from PIL import ImageFont
 from tkinter import (
     Tk, filedialog, messagebox,
     Toplevel, Frame, Label, Entry, Listbox, Scrollbar, Button,
     StringVar, END, SINGLE, BOTH, RIGHT, LEFT, Y, X
 )
 
+from decimal import Decimal, ROUND_HALF_UP, getcontext
+getcontext().prec = 28  # 足够高的计算精度
+
 PIVOT_BUCKETS = ['Current','1-30','31-60','61-90','91-365','366-730','731+']
+DEC5 = Decimal("0.00001")  # 5位小数
+
+# ---------- Decimal 工具 ----------
+def to_dec5(x):
+    """把任何输入转为保留5位小数的 Decimal；NaN/None -> 0"""
+    if pd.isna(x):
+        return Decimal("0").quantize(DEC5, rounding=ROUND_HALF_UP)
+    return Decimal(str(x)).quantize(DEC5, rounding=ROUND_HALF_UP)
+
+def df_to_dec5(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    """将 df 的指定列转为 Decimal(5位) 对象列"""
+    for c in cols:
+        if c in df.columns:
+            df[c] = df[c].apply(to_dec5)
+    return df
+
+def sum_dec(series: pd.Series) -> Decimal:
+    """对一列 Decimal 求和（Python 层求和，避免浮点）"""
+    total = Decimal("0")
+    for v in series:
+        if isinstance(v, Decimal):
+            total += v
+        elif pd.isna(v):
+            continue
+        else:
+            total += to_dec5(v)
+    return total.quantize(DEC5, rounding=ROUND_HALF_UP)
 
 # ---------- 带搜索框的选择器 ----------
 def choose_company_dialog(root, companies, title="选择公司"):
@@ -202,7 +230,7 @@ def read_master_raw(master_file: str, sheet_name: str | int | None = None) -> pd
 
 # ---------- 从“数据行”提取公司列表(排除说明区 & All Companies) ----------
 def extract_companies_for_choice(df: pd.DataFrame, company_col: str) -> list[str]:
-    # aging 桶转数值, 标记至少一个桶非空/数字
+    # aging 桶转数值, 标记至少一个桶非空/数字（仅用于判定数据行，不影响后续 Decimal 计算）
     aging_num = df[PIVOT_BUCKETS].apply(pd.to_numeric, errors="coerce")
     mask_data_row = df['Customer ID'].notna() & aging_num.notna().any(axis=1)
     companies = (
@@ -213,40 +241,38 @@ def extract_companies_for_choice(df: pd.DataFrame, company_col: str) -> list[str
     companies = companies[~companies.str.fullmatch(r'(?i)all\s+companies')]  # 去掉 All Companies
     return sorted(companies.unique().tolist())
 
-# ---------- 自动列宽 ----------
-def autosize_columns_xlsx(path, padding=2):
-    """智能调整列宽"""
-    font = ImageFont.load_default()
-    wb = load_workbook(path, data_only=True)
+# ---------- 导出 ----------
+def export_xlsx_multi(sheets: dict[str, pd.DataFrame], path: str):
+    try:
+        with pd.ExcelWriter(path, engine="openpyxl", datetime_format="yyyy-mm-dd hh:mm:ss") as xw:
+            for sheet_name, out in sheets.items():
+                if out is None or out.empty:
+                    pd.DataFrame().to_excel(xw, index=False, sheet_name=sheet_name)
+                    ws = xw.sheets[sheet_name]
+                    ws.freeze_panes = "A2"
+                    continue
 
-    def _display_text(cell):
-        v = cell.value
-        if v is None:
-            return ""
-        if cell.is_date:
-            return v.strftime("%Y-%m-%d")
-        if isinstance(v, (float, int)):
-            # round 到小数点后 5 位
-            return str(round(v, 5))
-        return str(v)
+                out.to_excel(xw, index=False, sheet_name=sheet_name)
+                ws = xw.sheets[sheet_name]
 
-    for ws in wb.worksheets:
-        for col_idx, col_cells in enumerate(ws.columns, 1):
-            max_width = 0
-            for cell in col_cells:
-                val = _display_text(cell)
-                try:
-                    width_px = font.getlength(val)
-                except Exception:
-                    width_px = len(val) * 11 * 0.6
-                if width_px > max_width:
-                    max_width = width_px
-            # 转换为 Excel 列宽单位
-            adjusted = (max_width / 7) + padding
-            col_letter = get_column_letter(col_idx)
-            ws.column_dimensions[col_letter].width = adjusted
-
-    wb.save(path)
+                # 冻结首行
+                ws.freeze_panes = "A2"
+                # 自动调整列宽
+                for j, col in enumerate(out.columns, start=1):
+                    values = out[col].tolist()[:1000]
+                    maxlen = 0
+                    for v in values:
+                        if v is None:
+                            s = ""
+                        else:
+                            s = str(v)
+                        l = len(s)
+                        if l > maxlen:
+                            maxlen = l
+                    maxlen = max(maxlen, len(str(col))) + 2
+                    ws.column_dimensions[get_column_letter(j)].width = min(maxlen, 80)
+    except Exception as ex:
+        raise RuntimeError(f"Failed to save Excel: {ex}") from ex
 
 # ---------- 主逻辑 ----------
 def generate_pivot(master_file: str, customer_file: str, output_file: str, root: Tk):
@@ -273,6 +299,7 @@ def generate_pivot(master_file: str, customer_file: str, output_file: str, root:
     default_sales_df = default_sales_df[['Number', 'Name', 'Salesman']].drop_duplicates(subset=['Number'])
 
     # 仅从“数据行”提取公司列表
+    # （这里只是识别哪些是有效数据行，不改变原值）
     companies = extract_companies_for_choice(master_df, company_col)
     if not companies:
         raise ValueError("未识别到可用公司。请确认总表的数据区(非说明区)中存在公司名称。")
@@ -284,8 +311,9 @@ def generate_pivot(master_file: str, customer_file: str, output_file: str, root:
         return False
 
     # 过滤出所选公司的数据行
-    aging_num = master_df[PIVOT_BUCKETS].apply(pd.to_numeric, errors="coerce")
-    mask_data_row = master_df['Customer ID'].notna() & aging_num.notna().any(axis=1)
+    # 注意：这里不要把桶列转 numeric，不然会提前进 float
+    aging_num_probe = master_df[PIVOT_BUCKETS].apply(pd.to_numeric, errors="coerce")
+    mask_data_row = master_df['Customer ID'].notna() & aging_num_probe.notna().any(axis=1)
     raw_df = master_df.loc[
         mask_data_row & (master_df[company_col].astype(str).str.strip() == chosen_company),
     ].copy()
@@ -302,21 +330,46 @@ def generate_pivot(master_file: str, customer_file: str, output_file: str, root:
     ).drop(columns=['Number'])
     merged_raw_df['Salesman'] = merged_raw_df['Salesman'].fillna('Unassigned')
 
-    # 透视/汇总
-    pivot_table = (
-        merged_raw_df
-        .groupby('Salesman', dropna=False)[PIVOT_BUCKETS]
-        .sum(numeric_only=True)
-        .reset_index()
+    # ======= 关键：把金额桶列转为 Decimal(5位) 再参与运算 =======
+    merged_raw_df = df_to_dec5(merged_raw_df, PIVOT_BUCKETS)
+
+    # 透视/汇总（对每个桶列做 Decimal 求和）
+    gb = merged_raw_df.groupby('Salesman', dropna=False)
+    pivot_data = {}
+    for bucket in PIVOT_BUCKETS:
+        pivot_data[bucket] = gb[bucket].apply(sum_dec)
+
+    pivot_table = pd.DataFrame(pivot_data).reset_index()
+
+    # Total = 各桶列逐行 Decimal 求和（保持 5 位）
+    pivot_table['Total'] = pivot_table[PIVOT_BUCKETS].apply(
+        lambda row: sum((v if isinstance(v, Decimal) else to_dec5(v)) for v in row).quantize(DEC5, rounding=ROUND_HALF_UP),
+        axis=1
     )
-    pivot_table['Total'] = pivot_table[PIVOT_BUCKETS].sum(axis=1)
+
+    # ======= 导出前：将 Decimal 转成 float（Excel 里可继续运算；显示位数交给 Excel）=======
+    def dec_to_float_df(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+        for c in cols:
+            if c in df.columns:
+                df[c] = df[c].apply(lambda v: float(v) if isinstance(v, Decimal) else v)
+        return df
+
+    pivot_table = dec_to_float_df(pivot_table, PIVOT_BUCKETS + ['Total'])
+    merged_raw_df = dec_to_float_df(merged_raw_df, PIVOT_BUCKETS)
 
     # 输出
-    with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
-        pivot_table.to_excel(writer, index=False, sheet_name='Pivot')
-        default_sales_df.to_excel(writer, index=False, sheet_name='Default Sales')
-        merged_raw_df.to_excel(writer, index=False, sheet_name='Raw')
-    autosize_columns_xlsx(output_file)
+    try:
+        export_xlsx_multi(
+            {
+                'Pivot': pivot_table,
+                'Default Sales': default_sales_df,
+                'Raw': merged_raw_df
+            },
+            output_file
+        )
+    except Exception as e:
+        messagebox.showerror("错误", f"保存Excel失败：\n{e}", parent=root)
+        return False
 
     return True
 
